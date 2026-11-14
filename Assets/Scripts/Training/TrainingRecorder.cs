@@ -49,7 +49,7 @@ namespace FightTrainer.Training
 
             // Header line: describes every number in "state".
             StringBuilder sb = new StringBuilder();
-            sb.Append("{\"type\":\"header\",\"version\":1,\"session\":\"").Append(SessionId)
+            sb.Append("{\"type\":\"header\",\"version\":" + StateEncoder.Version + ",\"session\":\"").Append(SessionId)
               .Append("\",\"source\":\"").Append(source)
               .Append("\",\"fighter\":\"").Append(fighterName)
               .Append("\",\"features\":[");

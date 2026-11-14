@@ -1,3 +1,5 @@
+using System;
+
 namespace FightTrainer.Core
 {
     public enum FighterMode
@@ -25,18 +27,19 @@ namespace FightTrainer.Core
     /// <summary>
     /// All the state for one fighter. Plain C# (no Unity types), so the fight can be simulated
     /// headless for tests and, later, for fast ML training.
+    /// Positions are in ring coordinates seen from above (see Vec2).
     /// </summary>
     public class Fighter
     {
         public readonly int index;
 
-        // Position / movement (world units, 1D along the floor)
-        public float x;
-        public float prevX;
-        public float walkVelocity;
-        public float knockVelocity;
-        public int facing = 1;          // +1 = facing right, -1 = facing left
-        public int dashDir;             // world direction of the current dash
+        // Position / movement
+        public Vec2 pos;
+        public Vec2 prevPos;
+        public Vec2 facing = new Vec2(1f, 0f);  // unit direction the fighter (and its guard) points
+        public FighterAction walkAction;          // Forward / Back / CircleLeft / CircleRight while walking
+        public Vec2 knockVelocity;
+        public Vec2 dashDir;                      // world direction of the current dash
 
         // Resources
         public float hp;
@@ -64,18 +67,29 @@ namespace FightTrainer.Core
         public FighterAction attemptedAction = FighterAction.Idle;
         public bool actionAccepted;
 
+        // Ring position (updated every tick)
+        public bool onRopes;
+        public bool inCorner;
+
         // Per-round stats (for judges + corner readout)
         public float damageDealtThisRound;
         public int hitsLandedThisRound;
+        public int angleHitsThisRound;      // hits that got around a block from the side
         public int blocksThisRound;
         public int dodgesThisRound;
+        public int ticksOnRopesThisRound;
+        public int ticksInCornerThisRound;
+        public int ticksCenterControlThisRound;
 
         public Fighter(int index)
         {
             this.index = index;
         }
 
-        public float Velocity { get { return x - prevX; } }
+        public Vec2 Velocity { get { return pos - prevPos; } }
+
+        /// <summary>+1 if facing right on screen, -1 if facing left (for side-view sprites).</summary>
+        public int ScreenFacing { get { return facing.x >= 0f ? 1 : -1; } }
 
         public AttackPhase Phase(FightConfig c)
         {
@@ -107,12 +121,22 @@ namespace FightTrainer.Core
             get { return mode == FighterMode.Idle || mode == FighterMode.Walk || mode == FighterMode.Block; }
         }
 
+        /// <summary>Distance from this fighter's centre to the nearest rope.</summary>
+        public float DistanceToRopes(FightConfig c)
+        {
+            return Math.Min(c.ringHalfSize - Math.Abs(pos.x), c.ringHalfSize - Math.Abs(pos.y));
+        }
+
         public void ResetRoundStats()
         {
             damageDealtThisRound = 0f;
             hitsLandedThisRound = 0;
+            angleHitsThisRound = 0;
             blocksThisRound = 0;
             dodgesThisRound = 0;
+            ticksOnRopesThisRound = 0;
+            ticksInCornerThisRound = 0;
+            ticksCenterControlThisRound = 0;
         }
     }
 }

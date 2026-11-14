@@ -6,12 +6,16 @@ using UnityEngine.InputSystem;
 namespace FightTrainer.InputSources
 {
     /// <summary>
-    /// You, on the keyboard (greybox controls; touch controls come later).
-    ///   A / D  or  Left / Right : walk back / forward   (double-tap, or Shift + direction = dash)
+    /// You, on the keyboard (greybox controls).
+    ///   W A S D  or  arrow keys : move around the ring (up = toward the back of the ring)
+    ///   double-tap a direction, or Shift + direction : dash
     ///   J : Jab     K : Heavy     L (hold) : Block     Space : Dodge
     ///
-    /// Presses (attacks, dodge, dash) are buffered for a few ticks so pressing slightly early still
-    /// works, e.g. queueing the next jab of a combo while the first one is still landing.
+    /// You press screen directions; they are translated into the fighter's opponent-relative buttons
+    /// (Forward, Back, Circle Left, Circle Right, Dash In, Dash Out) depending on where the opponent is.
+    /// That's what gets recorded, so the model learns "circle left", not "press W".
+    ///
+    /// Presses (attacks, dodge, dash) are buffered for a few ticks so pressing slightly early still works.
     /// </summary>
     public class KeyboardInput : IInputSource
     {
@@ -21,13 +25,14 @@ namespace FightTrainer.InputSources
         private const float DoubleTapWindow = 0.25f;
         private const int BufferTicks = 6;
 
-        private FighterAction bufferedPress = FighterAction.Idle; // Jab, Heavy, Dodge, or DashIn as "dash" marker
-        private int bufferedDashWorldDir;
+        private enum Press { None, Jab, Heavy, Dodge, Dash }
+
+        private Press bufferedPress = Press.None;
+        private Vec2 bufferedDashDir;
         private int bufferLeft;
         private FighterAction lastResolvedPress = FighterAction.Idle;
 
-        private float lastLeftTap = -10f;
-        private float lastRightTap = -10f;
+        private readonly float[] lastTap = { -10f, -10f, -10f, -10f }; // left, right, up, down
 
         /// <summary>Call every rendered frame (Update) so no key press is missed between ticks.</summary>
         public void Poll()
@@ -37,20 +42,21 @@ namespace FightTrainer.InputSources
             float t = Time.unscaledTime;
             bool shift = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
 
-            if (kb.jKey.wasPressedThisFrame) Buffer(FighterAction.Jab, 0);
-            if (kb.kKey.wasPressedThisFrame) Buffer(FighterAction.Heavy, 0);
-            if (kb.spaceKey.wasPressedThisFrame) Buffer(FighterAction.Dodge, 0);
+            if (kb.jKey.wasPressedThisFrame) Buffer(Press.Jab, Vec2.Zero);
+            if (kb.kKey.wasPressedThisFrame) Buffer(Press.Heavy, Vec2.Zero);
+            if (kb.spaceKey.wasPressedThisFrame) Buffer(Press.Dodge, Vec2.Zero);
 
-            if (kb.aKey.wasPressedThisFrame || kb.leftArrowKey.wasPressedThisFrame)
-            {
-                if (shift || t - lastLeftTap <= DoubleTapWindow) Buffer(FighterAction.DashIn, -1);
-                lastLeftTap = t;
-            }
-            if (kb.dKey.wasPressedThisFrame || kb.rightArrowKey.wasPressedThisFrame)
-            {
-                if (shift || t - lastRightTap <= DoubleTapWindow) Buffer(FighterAction.DashIn, +1);
-                lastRightTap = t;
-            }
+            Tap(0, kb.aKey.wasPressedThisFrame || kb.leftArrowKey.wasPressedThisFrame, new Vec2(-1f, 0f), shift, t);
+            Tap(1, kb.dKey.wasPressedThisFrame || kb.rightArrowKey.wasPressedThisFrame, new Vec2(1f, 0f), shift, t);
+            Tap(2, kb.wKey.wasPressedThisFrame || kb.upArrowKey.wasPressedThisFrame, new Vec2(0f, 1f), shift, t);
+            Tap(3, kb.sKey.wasPressedThisFrame || kb.downArrowKey.wasPressedThisFrame, new Vec2(0f, -1f), shift, t);
+        }
+
+        private void Tap(int slot, bool pressed, Vec2 dir, bool shift, float t)
+        {
+            if (!pressed) return;
+            if (shift || t - lastTap[slot] <= DoubleTapWindow) Buffer(Press.Dash, dir);
+            lastTap[slot] = t;
         }
 
         public void ClearBuffer()
@@ -58,23 +64,29 @@ namespace FightTrainer.InputSources
             bufferLeft = 0;
         }
 
-        private void Buffer(FighterAction press, int dashWorldDir)
+        private void Buffer(Press press, Vec2 dashDir)
         {
             bufferedPress = press;
-            bufferedDashWorldDir = dashWorldDir;
+            bufferedDashDir = dashDir;
             bufferLeft = BufferTicks;
         }
 
         public FighterAction GetAction(FightMatch match, int fighterIndex)
         {
             Fighter f = match.sim.fighters[fighterIndex];
+            Vec2 u = match.sim.ToOpponent(f);
 
             if (bufferLeft > 0)
             {
                 bufferLeft--;
-                FighterAction a = bufferedPress;
-                if (a == FighterAction.DashIn)
-                    a = bufferedDashWorldDir == f.facing ? FighterAction.DashIn : FighterAction.DashOut;
+                FighterAction a;
+                switch (bufferedPress)
+                {
+                    case Press.Jab: a = FighterAction.Jab; break;
+                    case Press.Heavy: a = FighterAction.Heavy; break;
+                    case Press.Dodge: a = FighterAction.Dodge; break;
+                    default: a = Vec2.Dot(bufferedDashDir, u) > 0f ? FighterAction.DashIn : FighterAction.DashOut; break;
+                }
                 lastResolvedPress = a;
                 return a;
             }
@@ -84,12 +96,24 @@ namespace FightTrainer.InputSources
 
             if (kb.lKey.isPressed) return FighterAction.Block;
 
-            int dir = 0;
-            if (kb.aKey.isPressed || kb.leftArrowKey.isPressed) dir -= 1;
-            if (kb.dKey.isPressed || kb.rightArrowKey.isPressed) dir += 1;
-            if (dir != 0) return dir == f.facing ? FighterAction.Forward : FighterAction.Back;
+            Vec2 dir = Vec2.Zero;
+            if (kb.aKey.isPressed || kb.leftArrowKey.isPressed) dir.x -= 1f;
+            if (kb.dKey.isPressed || kb.rightArrowKey.isPressed) dir.x += 1f;
+            if (kb.wKey.isPressed || kb.upArrowKey.isPressed) dir.y += 1f;
+            if (kb.sKey.isPressed || kb.downArrowKey.isPressed) dir.y -= 1f;
+            if (dir.x == 0f && dir.y == 0f) return FighterAction.Idle;
 
-            return FighterAction.Idle;
+            return ToRelativeMove(dir.Normalized, u);
+        }
+
+        /// <summary>Pick the opponent-relative move closest to the direction being pressed.</summary>
+        public static FighterAction ToRelativeMove(Vec2 dir, Vec2 toOpponent)
+        {
+            float forward = Vec2.Dot(dir, toOpponent);
+            float left = Vec2.Dot(dir, toOpponent.Left);
+            if (Mathf.Abs(forward) >= Mathf.Abs(left))
+                return forward > 0f ? FighterAction.Forward : FighterAction.Back;
+            return left > 0f ? FighterAction.CircleLeft : FighterAction.CircleRight;
         }
 
         public void OnActionResult(FighterAction action, bool accepted)

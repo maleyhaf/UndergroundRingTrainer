@@ -20,6 +20,11 @@ A 2D pixel-art competitive fighting simulator where the player acts as a **train
 
 ---
 
+## Platform
+**PC first** (Windows), played with **keyboard or controller**. A mobile port may come later, but it is not a goal for now (see §7 and §11 for why).
+
+---
+
 # 2. 🎮 Core Gameplay Loop
 
 ### Step 1: Select Fight
@@ -100,8 +105,10 @@ Inspired by Black & White's creature: behaviors trained early and reinforced rep
 
 # 4. 🥊 Combat System (2D Pixel)
 
-## Perspective
-* Side-view 2D arena
+## Perspective — Square Ring, Two Views
+* The fight takes place on a **square boxing ring** and is simulated in 2D **from above**: fighters move toward, away from, *and around* each other
+* **Main view:** KOF-style **side view with depth**: fighters further back in the ring stand higher on screen and are drawn behind
+* **Minimap:** a small **top-down view of the ring** (bottom-right) showing both fighters, which way their guard faces, the ropes and corners, and live ring-control readouts *(in the MVP; see §6.10 and §15.1 for the full design rationale)*
 
 ## Fight Format — Boxing-Style Rounds
 * Fights are a **fixed number of rounds**, scaled by tier:
@@ -138,20 +145,22 @@ Inspired by Black & White's creature: behaviors trained early and reinforced rep
 * *(Knockdowns can be simplified or cut for the MVP — see §13)*
 
 ## Fight Duration
-* Average fight: 90–240 seconds (many fights end early by KO)
+* Average fight: 90–240 seconds (many fights end early by KO). *Greybox measurement: Rookie AI vs Rookie AI averages ~1 minute; trained fighters are expected to fight longer.*
 * Maximum: 5 rounds × 60s = 300 seconds (plus corner breaks)
 
 ## Hitbox / Collision Model — "Classic Fighter Lite"
-* 2D rectangular hitboxes (NOT physics-based)
+* Simple 2D shapes, seen from above (NOT physics-based): bodies are circles; a punch is a line from the front of the body out to its reach
 * Frame-based attack windows
 * Simple per-frame collision checks
 * Each attack has: **startup frames → active hit frames → recovery frames**
 
 > Physics-based collision was rejected: it destabilizes ML training, makes behavior hard to debug, and creates unpredictable movement that breaks the learning loop.
 
-## Moveset — The 8 Buttons
+## Moveset — The Buttons
 
-**Key principle:** every fighter has the same fixed moveset from day one. Training never creates or unlocks moves — it teaches **when** to use them. The fighter's brain "presses" the exact same 8 buttons the player uses (see §5.3), so whatever the player does with the controls is directly copyable.
+**Key principle:** every fighter has the same fixed moveset from day one. Training never creates or unlocks moves — it teaches **when** to use them. The fighter's brain "presses" the exact same buttons the player uses (11 in total, see §5.3), so whatever the player does with the controls is directly copyable.
+
+**All movement is relative to the opponent**, not the screen. The player presses screen directions; the game translates them into the buttons below depending on where the opponent stands. That's also what gets recorded, so the fighter learns "circle left", not "press W".
 
 Frame data at 60 fps (startup = visible wind-up; recovery = punishable cool-down). Values are starting points for tuning.
 
@@ -161,9 +170,10 @@ Frame data at 60 fps (startup = visible wind-up; recovery = punishable cool-down
 | Heavy | Hook / cross | 12 → 3 → 20 | High | High | Big damage, can cause knockdowns, very punishable on whiff |
 | Block | Guard (hold) | Instant | ~75% damage reduction | Each blocked hit drains stamina | Safe defense; **guard break** when stamina hits 0 |
 | Dodge | Slip / sway | 8 invulnerable frames, 20 total | — | Medium | Avoid a hit, opens the Counter Window |
-| Forward | Walk in | — | — | — | Close distance |
-| Back | Walk out | — | — | Slow regen | Create space, recover |
-| Dash | Burst in/out (double-tap direction) | 15 frames | — | Medium | Fast distance change |
+| Forward | Walk toward the opponent | — | — | — | Close distance, cut off the ring |
+| Back | Walk away from the opponent | — | — | Slow regen | Create space, recover |
+| Circle Left / Circle Right | Sidestep around the opponent, keeping the same distance | — | — | — | Find angles, escape the ropes, stay off the line of fire |
+| Dash In / Dash Out | Burst toward / away (double-tap a direction) | 15 frames | — | Medium | Fast distance change |
 | Idle | Stand ready | — | — | Fast regen | Wait, bait, recover |
 
 ### Combos
@@ -185,8 +195,33 @@ Frame data at 60 fps (startup = visible wind-up; recovery = punishable cool-down
 * Running out of stamina forces the fighter into a vulnerable state
 * Idle and Back regenerate stamina; partial recovery between rounds
 
+## Ring & Movement (2D)
+
+### The Ring
+* Square ring, **8 × 8 units** (fighters are 0.8 units wide), with ropes on all four sides; the ropes stop movement
+* **On the ropes:** within 0.7 units of a rope. **In a corner:** near two ropes at once
+* Fighters start each round on opposite sides of the centre, 3 units apart
+
+### Circling, Facing & Angles
+* **Circling** keeps the same distance to the opponent, moving around them like real boxers
+* Fighters **turn to face their opponent automatically, at a limited speed**:
+  * Free (standing, walking): fast turn (8°/tick)
+  * **Blocking: slow turn (1°/tick)**
+  * Dodging: medium turn
+  * Attacking, dashing or stunned: no turning. Punches are aimed where the fighter faced when the punch started
+* **Block covers ±70°** in front of the fighter. A hit from outside that arc goes **around the guard** and lands for full damage (**Angle Hit**, flashed "ANGLE!")
+* Result: circling around someone who is turtling gets you outside their guard in about **1 second**, which is a teachable, visible skill. Stepping off the line during an opponent's wind-up can also make their punch miss
+
+### Ring Metrics (tracked per round)
+| Metric | Meaning | Used by |
+|---|---|---|
+| Centre control time | Time spent closer to the ring centre than the opponent (by 0.3+ units) | Judges (ring control), corner break, minimap |
+| Time on the ropes | Time within the rope zone | Corner break, minimap, ML input |
+| Time in a corner | Time near two ropes | Corner break, minimap, ML input |
+| Angle hits | Hits that got around a block from the side | Corner break, replays, Habit Report |
+
 ## Combat Depth
-Focused on: **Timing, Spacing, Reaction** — NOT move complexity.
+Focused on: **Timing, Spacing, Angles, Reaction** — NOT move complexity.
 
 ---
 
@@ -209,12 +244,21 @@ Per decision step:
 * Stamina
 * Current round / rounds remaining / round time remaining
 * Estimated scorecard lead (rounds up / down) — lets the fighter learn to protect a lead or chase a KO when behind
+* **Ring & angle features (2D ring):**
+  * Sideways (circling) velocity relative to the opponent
+  * How far my guard is turned away from the opponent, how far I am off *their* guard, and whether their block would cover my punch
+  * Distance to the ropes (me and opponent), on-the-ropes and in-a-corner flags (me and opponent)
+  * Room behind me / room behind the opponent (can I back up? can I trap them?)
+  * Distance to the ring centre and which way the centre is (forward / to my left)
+
+All ring features are **relative to the opponent** (forward = toward them), so a fighter learns "my back is to the ropes" rather than absolute ring coordinates. Current encoding (v2): **51 numbers** per decision, including one-hot opponent situation (12) and previous action (11).
 
 ## 5.3 Action Space (Output)
-The model outputs one of the **same 8 buttons** the player uses (see §4 Moveset):
+The model outputs one of the **same 11 buttons** the player uses (see §4 Moveset):
 * Idle
-* Move forward / Move back
-* Dash
+* Forward / Back
+* Circle Left / Circle Right
+* Dash In / Dash Out
 * Jab (light attack)
 * Heavy attack
 * Block
@@ -228,7 +272,7 @@ The model outputs one of the **same 8 buttons** the player uses (see §4 Moveset
 ## 5.4 Model Architecture — Small MLP (Neural Network)
 
 **Architecture:**
-* Input layer: state vector (10–20 values)
+* Input layer: state vector (~50 values, see §5.2)
 * Hidden layers: 2 layers, 32–64 neurons each
 * Output: probability distribution over actions (softmax)
 * Framework: **PyTorch**
@@ -251,7 +295,7 @@ Reward signals:
 * Successful dodge/block (+)
 * Player feedback from Spar mode (Good/Bad presses) as an extra reward signal
 
-> Why this matters: pure behavior cloning can never be better than the player's own demonstrations (which will be imperfect on touch controls). Feedback and RL are what let a fighter eventually **outgrow its trainer** — a natural late-game story beat.
+> Why this matters: pure behavior cloning can never be better than the player's own demonstrations (which will always be a bit imperfect). Feedback and RL are what let a fighter eventually **outgrow its trainer** — a natural late-game story beat.
 
 ## 5.6 Training Data Sources
 
@@ -315,6 +359,8 @@ Instead of only free play, the player can pick a **Drill**: a set-up scenario re
 * "Opponent dashes in from mid-range" × 10 reps
 * "Opponent throws heavies when you're low on stamina" × 8 reps
 * "Opponent backs into the corner" × 10 reps
+* "Escape the corner" × 8 reps (start trapped, get back to the centre)
+* "Cut off the ring" × 8 reps (opponent keeps circling away)
 
 Drills target the exact situations the fighter is weak in and produce much denser training data than free play.
 
@@ -416,10 +462,24 @@ Pillar 1 holds: the player never controls the fighter in a real fight. Instead t
 
 ## 6.9 Teaching the Moveset
 
-### Gym Controls (mobile, landscape)
-* **Left thumb:** ◀ Back / ▶ Forward (double-tap = Dash)
-* **Right thumb:** 2×2 grid — Block, Dodge (top) / Jab, Heavy (bottom)
+### Gym Controls (PC — keyboard or controller)
+
+| Action | Keyboard | Controller |
+|---|---|---|
+| Move around the ring | W A S D (or arrow keys) | Left stick or D-pad |
+| Dash | Double-tap direction, or Shift + direction | Double-tap direction, or RB / R1 + direction |
+| Minimap size (normal / large / off) | M | View / Select |
+| Jab | J | X / Square |
+| Heavy | K | Y / Triangle |
+| Block (hold) | L | LB / L1 |
+| Dodge | Space | A / Cross |
+| Take Over (hold) | F | RT / R2 |
+| Spar feedback 👎 / 👍 | Q / E | LT / L2 and RT / R2 (Spar only) |
+
+* Up/down move toward the back/front of the ring. The game turns the pressed direction into Forward / Back / Circle Left / Circle Right depending on where the opponent is (whichever matches the pressed direction best).
+* Exact bindings are starting points, finalized in playtesting; all keys are rebindable in Settings.
 * Top HUD: both health bars, stamina, current mode badge, Drill name + rep counter, recording indicator
+* The greybox (Milestone 0) already uses the keyboard column above.
 
 ### What Each Move Teaches — and the Best Mode for It
 
@@ -431,7 +491,26 @@ Pillar 1 holds: the player never controls the fighter in a real fight. Instead t
 | Block | Block when an attack is coming, not constantly (it drains stamina) | Spar (👎 when turtling, 👍 on a real block) |
 | Dodge + Counter | Dodge heavies, then punish in the Counter Window | Drill: "Opponent throws heavies" |
 | Movement / Dash | Spacing — stay just out of range, dash in when the opponent is recovering | Show + Take Over |
+| Circling | Get outside a turtling opponent's guard; step off the line of a heavy | Show + Spar (👍 on an Angle Hit) |
+| Ring position | Don't get trapped on the ropes or in a corner; cut off an opponent who runs | Drills: "Escape the corner", "Cut off the ring" |
 | Idle / Back | Recover stamina instead of panicking | Spar (👍 when it backs off at low stamina) |
+
+## 6.10 The Ring Minimap
+
+A small **top-down view of the ring**, shown in fights, the gym and replays (bottom-right corner; toggle normal / large / hidden).
+
+### What It Shows
+* The ring: ropes, corner posts, centre mark, and the shaded rope zone
+* Both fighters as dots, with a short line showing **which way their guard faces** (brighter while blocking)
+* The attacking fighter's dot flashes red on active punch frames
+* Live readouts under the map: each fighter's ring status (**open / ropes / CORNER**) and **centre control %** for the round
+
+### Why It Matters
+* The side view can't show depth clearly. When fighters circle, the minimap makes it obvious who has the angle and who is trapped
+* It makes the ring metrics *visible*, which supports the core goal: the player can see their fighter learned to escape the corner or cut off the ring
+* Later: the same view powers ring-position review in replays and the Habit Report (e.g. *"Spends 40% less time on the ropes"*)
+
+## 6.11 Teaching Example
 
 ### Example Teaching Loop
 1. **Real fight:** fighter loses round 2 by throwing Heavy into the opponent's block repeatedly. Player tags those moments ❌ Bad in the replay.
@@ -445,10 +524,18 @@ Pillar 1 holds: the player never controls the fighter in a real fight. Instead t
 
 # 7. 🖥️ UI / UX Design
 
-## Platform: Mobile-First (Unity)
-* Large touch-friendly buttons
-* Minimal HUD
-* Simplified layout
+## Platform: PC First (Unity)
+* Windows first; 16:9 layout, scales to common resolutions
+* **Keyboard or controller** for fighting; menus work with mouse, keyboard, or controller
+* Minimal HUD, clear readable layout
+* On-screen button prompts switch automatically between keyboard and controller icons
+
+> **Why PC first (decided Nov 2026):**
+> 1. **Teaching by playing needs precise input.** Show mode is the heart of the game, and the fighter copies how the player plays. Keyboard and controller give cleaner demonstrations than touch, so fighters learn better.
+> 2. **The ML brain can run locally.** On PC, the Python ML server runs on the same machine as the game, with no internet, hosting costs or lag (see §11).
+> 3. **Fighting-game audience.** Players of this genre mostly play on PC and console with keyboards and controllers.
+>
+> A mobile port stays possible later: the core fight code has no platform dependencies, and the brain can be moved inside the game (see §11, "Future: Mobile Port").
 
 ## 7.1 Main Menu
 * Continue
@@ -478,14 +565,15 @@ Pillar 1 holds: the player never controls the fighter in a real fight. Instead t
 ## 7.5 Gym Screen
 * Mode select: **Show / Spar / Take Over**
 * Drill picker (Show mode)
-* Arena view: fighter + sim opponent
-* On-screen fight controls (touch)
+* Arena view: fighter + sim opponent, with the ring minimap
+* Keyboard / controller fight controls, with on-screen button prompts
 * Spar: 👍 / 👎 live feedback buttons
-* Take Over: large hold-to-control button
+* Take Over: hold-to-control key / trigger, with a clear "YOU HAVE CONTROL" indicator
 * End of session → retrain → Habit Report
 
 ## 7.6 Fight Screen
 * Health bars (top) — carry over between rounds, round counter (e.g., "Round 2 / 3"), round timer
+* **Ring minimap** (bottom-right): top-down ring, both fighters and their guard direction, ropes/corner status, centre control % (see §6.10)
 * Knockdown count animation
 * Fighter names
 * Small decision indicators (icons)
@@ -493,7 +581,7 @@ Pillar 1 holds: the player never controls the fighter in a real fight. Instead t
 * Minimal UI — focus on the fight
 
 ## 7.7 Corner Break Screen
-* Last-round 3-stat readout + estimated scorecard
+* Last-round readout per fighter: hits (and how many came from angles), blocks, dodges, **centre-control time, time on the ropes, time in a corner** + estimated scorecard (noting when ring control decided the round)
 * Corner action picker (Patch Up / Catch Breath / Fire Them Up)
 * Strategy Bias switcher
 * Auto-continues after ~15s
@@ -587,7 +675,8 @@ No hard ending. The long-term goal is:
 # 11. 🧱 Technical Architecture
 
 ## Engine
-* Unity (2D) — Mobile-first build
+* Unity 6 (2D, URP) — **PC (Windows) build first**
+* New Input System (keyboard + controller from the same action bindings)
 
 ## ML Bridge — Option B: Python Backend (FastAPI)
 
@@ -604,6 +693,16 @@ No hard ending. The long-term goal is:
 
 ### Communication
 * WebSockets (real-time during fights, Spar and Take Over)
+
+### Running Locally on PC
+* The Python server runs **on the player's own machine**, started automatically by the game and connected over `localhost`
+* No internet connection, no server hosting costs, and no network lag
+* Packaging (shipping Python + PyTorch with the game) to be solved before release; during development it runs from a terminal
+
+### Future: Mobile Port (not planned yet)
+* Phones can't run the Python server alongside the game, so a mobile version would run the trained model **inside Unity** (Unity's Inference Engine, formerly Sentis), exported from PyTorch via ONNX
+* Training could stay on PC or a server; only the brain's decisions need to run on the phone
+* Touch controls would need their own design (see the earlier landscape thumb layout idea: movement on the left, a 2×2 action grid on the right)
 
 ## Core Unity Scripts
 
@@ -653,7 +752,8 @@ One fighter. One loop. Visible learning. Real fighting action in the gym.
 ### Core
 * 1 fighter
 * 1 opponent type (rule-based aggressive archetype)
-* Combat system with **boxing-style rounds**: 3 × 60s rounds, HP carries over, KO anytime, simple judge decision (single scorer, round winner by damage dealt) if no KO
+* Combat system with **boxing-style rounds**: 3 × 60s rounds, HP carries over, KO anytime, simple judge decision (single scorer: round winner by damage dealt; if damage is even, **ring control** breaks the tie) if no KO
+* **2D ring movement**: square ring with ropes and corners, circling, turn rates, guard arc and Angle Hits, ring metrics (centre control, ropes, corners)
 * No knockdowns in MVP (HP 0 = KO)
 * Gym: **Show** (free play), **Spar** (player fights their fighter, 👍/👎 feedback), **Take Over** (basic hold-to-control)
 * Simple behavior cloning + Take Over corrections (MLP via Python backend)
@@ -662,7 +762,7 @@ One fighter. One loop. Visible learning. Real fighting action in the gym.
 ### UI
 * Basic hub screen
 * Gym screen (3 modes)
-* Fight screen with round counter
+* Fight screen with round counter and **ring minimap** (basic, §6.10)
 * Simple corner break (Strategy Bias switch + Patch Up / Catch Breath choice)
 * Post-fight summary
 * Basic Habit Report (text list of top changes)
@@ -689,26 +789,78 @@ One fighter. One loop. Visible learning. Real fighting action in the gym.
 * Injury system
 * Advanced UI polish
 * Multiple arenas
+* Ring polish beyond the basics: real depth-sorted sprites with turn animations, minimap ring review in replays, ring-control lines in the Habit Report, "power hand" side bias
 
 ---
 
 # 14. 📌 Build Execution Order
 
-1. Basic fighter movement + the 8-button moveset (frame data, combos, Counter Window, stamina)
+1. Basic fighter movement + the moveset (frame data, combos, Counter Window, stamina)
 2. Round system (timer, HP carry-over, KO, simple decision scoring)
-3. Simple rule-based AI opponent
-4. Show mode recording
-5. Python ML server + basic MLP
-6. Unity ↔ Python WebSocket connection
-7. Spar mode (player controls opponent, fighter AI, 👍/👎)
-8. Take Over mode (ControlArbiter hand-off)
-9. Habit Report
-10. UI screens (hub, gym, fight, corner break, post-fight)
-11. Fight loop + money system
+3. 2D ring movement (circling, turning, guard arc, ropes/corners, ring metrics) + ring minimap
+4. Simple rule-based AI opponent (with basic ring sense)
+5. Show mode recording
+6. Python ML server + basic MLP
+7. Unity ↔ Python WebSocket connection
+8. Spar mode (player controls opponent, fighter AI, 👍/👎)
+9. Take Over mode (ControlArbiter hand-off)
+10. Habit Report
+11. UI screens (hub, gym, fight, corner break, post-fight)
+12. Fight loop + money system
+
+*Status (Nov 2026): steps 1–5 are built in the Milestone 0 greybox.*
 
 ---
 
-# 15. 🧠 Final Note
+# 15. 🔭 Future Features & Design Notes
+
+## 15.1 Top-Down Ring View — Circling & Ring Generalship
+
+> **Status (Nov 2026): decided and pulled into the MVP.** Option B below was chosen: the fight is simulated in 2D, shown in the side view with depth, plus a top-down ring minimap. A basic version is built in the greybox (see §4 "Ring & Movement", §6.10). This section keeps the original reasoning and the later polish.
+
+### Why
+A big part of real boxing happens before a punch is thrown: circling the opponent, watching their habits, cutting off the ring, trapping them on the ropes or in a corner, and stepping off-line to create angles. The side view only allows moving forward and back. A **top-down view of the ring** keeps the game 2D while adding that second axis of movement.
+
+### What It Adds
+* **A real ring:** a square ring with ropes and four corners replaces the left/right walls.
+* **Circling:** fighters can move around each other, not just toward and away. They still always face their opponent.
+* **Ring generalship:** cornering an opponent, escaping the ropes, cutting off the ring when the opponent runs, and controlling the centre.
+* **Angles:** punches land in a forward cone, so stepping to the side and then punching can catch an opponent who is only defending straight ahead.
+* **Judging:** "Ring control" (already a judging criterion in §4) becomes measurable: time spent controlling the centre vs. time spent trapped on the ropes.
+
+### How It Fits the Trainer Loop
+It adds a whole new layer of habits to teach, all through the existing gym modes:
+* *"Circle away from his power hand."*
+* *"Don't get trapped in the corner."*
+* *"Cut off the ring when he keeps running."*
+* New Drills, e.g. "Escape the corner" and "Cut off the ring"
+* New Habit Report lines, e.g. *"Spends 40% less time on the ropes"*
+
+### What Changes Technically
+* **Fight sim:** positions become 2D (x, y). The opponent's relative position becomes distance + angle, and hit detection uses 2D shapes (a cone or arc in front of the fighter) instead of a line.
+* **Action space:** adds **Circle Left** and **Circle Right** (sidestep around the opponent while facing them): 9 → 11 buttons. Forward / Back / Dash stay relative to the opponent, as they are now.
+* **ML state vector:** adds own distance to the ropes and the nearest corner, the opponent's distance to the ropes, the angle around the opponent, and sideways velocity.
+* **Training data:** recordings made before the 2D ring (version 1) are not compatible with the new inputs and buttons. The recorder now writes **version 2**, and old v1 files should be discarded.
+* **What already helps:** the fight logic is plain C# with no Unity dependency, every action is already relative to the opponent, and the sim is deterministic. Moving from 1D to 2D is a contained change to the core, not a rewrite of the game.
+
+### Presentation — Decided: Option B
+How the top-down view sits alongside the KOF-style side view has a big effect on the art workload. **Option B was chosen** (Nov 2026):
+
+| Option | Description | Trade-off |
+|---|---|---|
+| A. Top-down only | The whole fight is shown from above | Loses the KOF side-view look the art direction is built around |
+| B. Two views of one fight | The fight is simulated in 2D; the main screen stays side-view, plus a top-down ring view (toggle or mini-map) showing positions | Keeps the KOF look; top-down art can be simple tokens. The side view must handle fighters moving "into" the screen |
+| C. Side-view camera that rotates | The fight is simulated top-down; the camera always stays side-on to the two fighters (like modern 3D boxing games) | Most authentic feel, but effectively 2.5D, with the heaviest art and animation cost |
+| D. Top-down for tactics only | Side view for fights; top-down used in the gym and replays to teach and review positioning | Cheapest, but circling isn't part of the live fight |
+
+### Scope & Timing
+* **In the MVP (basic):** 2D ring sim, circling, turning, guard arc + Angle Hits, ropes/corners, ring metrics, ring-control tiebreak in judging, minimap, Rookie AI ring sense.
+* **Later (polish):** pixel-art sprites that handle depth well (facing toward / away from the camera, turn animations), minimap ring review in replays, ring-control lines in the Habit Report, ring-position Drills, "power hand" side bias, ring control in 3-judge scoring.
+* **Sprite implication:** because fighters can face into and out of the screen, each fighter needs at least side-facing plus three-quarter (toward / away) poses. Plan this before full sprite production.
+
+---
+
+# 16. 🧠 Final Note
 
 This project succeeds if:
 

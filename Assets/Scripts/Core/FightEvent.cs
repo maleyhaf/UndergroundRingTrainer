@@ -5,6 +5,8 @@ namespace FightTrainer.Core
         AttackStarted,
         Hit,
         CounterHit,
+        /// <summary>A hit that landed on a blocking fighter from outside their guard (circled around it).</summary>
+        AngleHit,
         Blocked,
         GuardBreak,
         Dodged,

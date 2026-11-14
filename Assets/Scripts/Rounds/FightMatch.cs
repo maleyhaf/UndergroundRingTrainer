@@ -92,7 +92,7 @@ namespace FightTrainer.Rounds
                     }
                     else if (roundTicksLeft <= 0)
                     {
-                        judge.ScoreRound(round, sim);
+                        judge.ScoreRound(round, sim, config.RoundTicks);
                         SetPhase(MatchPhase.RoundOver);
                     }
                     break;

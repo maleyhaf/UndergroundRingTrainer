@@ -9,12 +9,13 @@ using UnityEngine;
 namespace FightTrainer.Game
 {
     /// <summary>
-    /// Milestone 0 greybox: two rectangles boxing under the real rules.
+    /// Milestone 0 greybox: two rectangles boxing under the real rules, on a square ring.
     ///
     /// Runs the fight at a fixed 60 ticks per second, separate from rendering, feeds each fighter
-    /// from an IInputSource (you or the Rookie AI), and draws the result with plain coloured boxes.
+    /// from an IInputSource (you or the Rookie AI), and draws the result with plain coloured boxes:
+    /// a side view with depth (further back in the ring = higher on screen) plus a top-down minimap.
     ///
-    /// Hotkeys: F1 debug overlay · F2 slow motion · P pause · F5 new fight ·
+    /// Hotkeys: F1 debug overlay · F2 slow motion · P pause · F5 new fight · M minimap size ·
     ///          Tab swap you <-> Rookie AI (watch AI vs AI) · R start/stop recording
     /// </summary>
     public class GreyboxGame : MonoBehaviour
@@ -35,13 +36,25 @@ namespace FightTrainer.Game
         public bool Paused { get; private set; }
         public bool SlowMotion { get; private set; }
 
-        public const float GroundY = -2f;
+        public enum MinimapMode { Normal, Large, Hidden }
+        public MinimapMode Minimap { get; private set; }
+
+        /// <summary>Screen height of the ring's centre line.</summary>
+        public const float GroundY = -1.6f;
+        /// <summary>How much the ring's depth is squashed in the side view.</summary>
+        public const float DepthScale = 0.32f;
         public const float BodyHeight = 1.8f;
+
+        /// <summary>Ring position (seen from above) -> world position in the side view.</summary>
+        public static Vector3 RingToWorld(Vec2 ring, float height)
+        {
+            return new Vector3(ring.x, GroundY + ring.y * DepthScale + height, 0f);
+        }
 
         public class Flash
         {
             public string text;
-            public float x;
+            public Vec2 pos;
             public int ticksLeft;
             public Color color;
         }
@@ -91,7 +104,7 @@ namespace FightTrainer.Game
                 cam.tag = "MainCamera";
             }
             cam.orthographic = true;
-            cam.orthographicSize = 4f;
+            cam.orthographicSize = 3.5f;
             cam.transform.position = new Vector3(0f, 0f, -10f);
             cam.backgroundColor = new Color(0.06f, 0.05f, 0.08f);
             cam.clearFlags = CameraClearFlags.SolidColor;
@@ -99,10 +112,36 @@ namespace FightTrainer.Game
             Transform root = new GameObject("Arena").transform;
             root.SetParent(transform, false);
 
-            float width = config.arenaHalfWidth * 2f;
-            Box(root, "Floor", new Vector2(0f, GroundY - 0.15f), new Vector2(width + 2f, 0.3f), new Color(0.22f, 0.2f, 0.24f), -10);
-            Box(root, "Wall L", new Vector2(-config.arenaHalfWidth - 0.1f, GroundY + 1.5f), new Vector2(0.2f, 3f), new Color(0.3f, 0.12f, 0.14f), -10);
-            Box(root, "Wall R", new Vector2(config.arenaHalfWidth + 0.1f, GroundY + 1.5f), new Vector2(0.2f, 3f), new Color(0.3f, 0.12f, 0.14f), -10);
+            // Ring: canvas floor, apron, corner posts, ropes. Back ropes behind the fighters,
+            // front ropes in front of them (see-through so the fight stays readable).
+            float r = config.ringHalfSize;
+            float depth = r * 2f * DepthScale;
+            Color rope = new Color(0.75f, 0.15f, 0.2f);
+            Color post = new Color(0.35f, 0.35f, 0.4f);
+            Box(root, "Apron", new Vector2(0f, GroundY - r * DepthScale - 0.25f), new Vector2(r * 2f + 1f, 0.5f), new Color(0.12f, 0.1f, 0.13f), -20);
+            Box(root, "Canvas", new Vector2(0f, GroundY), new Vector2(r * 2f, depth), new Color(0.22f, 0.2f, 0.24f), -20);
+            Box(root, "Centre mark", new Vector2(0f, GroundY), new Vector2(0.3f, 0.3f * DepthScale), new Color(0.3f, 0.28f, 0.33f), -19);
+            float backY = GroundY + r * DepthScale, frontY = GroundY - r * DepthScale;
+            foreach (float sx in new[] { -r, r })
+            {
+                Box(root, "Post back", new Vector2(sx, backY + 0.6f), new Vector2(0.12f, 1.2f), post, -18);
+                Box(root, "Post front", new Vector2(sx, frontY + 0.6f), new Vector2(0.14f, 1.2f), post, 300);
+            }
+            foreach (float hy in new[] { 0.45f, 0.85f, 1.15f })
+            {
+                Box(root, "Rope back", new Vector2(0f, backY + hy), new Vector2(r * 2f, 0.05f), rope, -18);
+                Box(root, "Rope front", new Vector2(0f, frontY + hy), new Vector2(r * 2f, 0.06f), new Color(rope.r, rope.g, rope.b, 0.35f), 300);
+            }
+            for (int side = -1; side <= 1; side += 2)
+            {
+                // Side ropes run "into" the screen: drawn as slanted lines from front post to back post.
+                for (int k = 0; k < 3; k++)
+                {
+                    float hy = k == 0 ? 0.45f : (k == 1 ? 0.85f : 1.15f);
+                    SpriteRenderer sr = Box(root, "Rope side", new Vector2(side * r, GroundY + hy), new Vector2(0.04f, depth), new Color(rope.r, rope.g, rope.b, 0.5f), -17);
+                    sr.transform.localScale = new Vector3(0.04f, depth, 1f);
+                }
+            }
 
             views = new[]
             {
@@ -200,6 +239,7 @@ namespace FightTrainer.Game
             if (kb.f2Key.wasPressedThisFrame) SlowMotion = !SlowMotion;
             if (kb.pKey.wasPressedThisFrame) Paused = !Paused;
             if (kb.f5Key.wasPressedThisFrame) NewFight();
+            if (kb.mKey.wasPressedThisFrame) Minimap = (MinimapMode)(((int)Minimap + 1) % 3);
 
             if (kb.tabKey.wasPressedThisFrame)
             {
@@ -230,16 +270,17 @@ namespace FightTrainer.Game
             Fighter target = e.target >= 0 ? Match.sim.fighters[e.target] : Match.sim.fighters[e.actor];
             switch (e.type)
             {
-                case FightEventType.CounterHit: AddFlash("COUNTER!", target.x, new Color(1f, 0.85f, 0.2f)); break;
-                case FightEventType.GuardBreak: AddFlash("GUARD BREAK", target.x, new Color(1f, 0.3f, 0.9f)); break;
-                case FightEventType.Dodged: AddFlash("DODGE", Match.sim.fighters[e.actor].x, new Color(0.4f, 1f, 0.9f)); break;
-                case FightEventType.KO: AddFlash("KO", target.x, new Color(1f, 0.25f, 0.2f)); break;
+                case FightEventType.CounterHit: AddFlash("COUNTER!", target.pos, new Color(1f, 0.85f, 0.2f)); break;
+                case FightEventType.AngleHit: AddFlash("ANGLE!", target.pos, new Color(1f, 0.6f, 0.2f)); break;
+                case FightEventType.GuardBreak: AddFlash("GUARD BREAK", target.pos, new Color(1f, 0.3f, 0.9f)); break;
+                case FightEventType.Dodged: AddFlash("DODGE", Match.sim.fighters[e.actor].pos, new Color(0.4f, 1f, 0.9f)); break;
+                case FightEventType.KO: AddFlash("KO", target.pos, new Color(1f, 0.25f, 0.2f)); break;
             }
         }
 
-        private void AddFlash(string text, float x, Color color)
+        private void AddFlash(string text, Vec2 pos, Color color)
         {
-            flashes.Add(new Flash { text = text, x = x, ticksLeft = 45, color = color });
+            flashes.Add(new Flash { text = text, pos = pos, ticksLeft = 45, color = color });
         }
     }
 }

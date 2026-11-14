@@ -6,7 +6,8 @@ namespace FightTrainer.Game
 {
     /// <summary>
     /// Greybox HUD (IMGUI, placeholder until the real pixel-art UI): health + stamina bars,
-    /// round counter and timer, judge scorecard, round banners, corner break buttons, result screen.
+    /// round counter and timer, judge scorecard, round banners, corner break buttons, result screen,
+    /// and the top-down ring minimap.
     /// Laid out on a 1280×720 canvas scaled to the window.
     /// </summary>
     public class FightHud : MonoBehaviour
@@ -90,13 +91,16 @@ namespace FightTrainer.Game
             {
                 foreach (GreyboxGame.Flash fl in game.flashes)
                 {
-                    Vector3 sp = cam.WorldToScreenPoint(new Vector3(fl.x, GreyboxGame.GroundY + GreyboxGame.BodyHeight + 0.6f, 0f));
+                    Vector3 sp = cam.WorldToScreenPoint(GreyboxGame.RingToWorld(fl.pos, GreyboxGame.BodyHeight + 0.6f));
                     float rise = (45 - fl.ticksLeft) * 0.6f;
                     GUIStyle st = new GUIStyle(center) { fontSize = 26, fontStyle = FontStyle.Bold };
                     st.normal.textColor = fl.color;
                     GUI.Label(new Rect(sp.x / scale - 100, (Screen.height - sp.y) / scale - 20 - rise, 200, 40), fl.text, st);
                 }
             }
+
+            if (game.Minimap != GreyboxGame.MinimapMode.Hidden && m.phase != MatchPhase.CornerBreak)
+                Minimap(m, w, game.Minimap == GreyboxGame.MinimapMode.Large);
 
             // Footer: controls + status
             string status = "";
@@ -106,8 +110,8 @@ namespace FightTrainer.Game
             GUIStyle rich = new GUIStyle(small) { richText = true };
             GUI.Label(new Rect(0, H - 56, w, 22), status, rich);
             GUI.Label(new Rect(0, H - 32, w, 22),
-                "A/D move (double-tap = dash)  ·  J jab  ·  K heavy  ·  L block  ·  Space dodge  ·  " +
-                "F1 debug  ·  F2 slow-mo  ·  P pause  ·  R record  ·  Tab AI vs AI  ·  F5 new fight", small);
+                "WASD move (double-tap = dash)  ·  J jab  ·  K heavy  ·  L block  ·  Space dodge  ·  " +
+                "M minimap  ·  F1 debug  ·  F2 slow-mo  ·  P pause  ·  R record  ·  Tab AI vs AI  ·  F5 new fight", small);
         }
 
         private void CornerBreak(FightMatch m, float w)
@@ -121,9 +125,9 @@ namespace FightTrainer.Game
 
             Fighter a = m.sim.fighters[0], b = m.sim.fighters[1];
             string stats =
-                game.displayNames[0] + ":  hits " + a.hitsLandedThisRound + " · blocks " + a.blocksThisRound + " · dodges " + a.dodgesThisRound + "\n" +
-                game.displayNames[1] + ":  hits " + b.hitsLandedThisRound + " · blocks " + b.blocksThisRound + " · dodges " + b.dodgesThisRound;
-            GUI.Label(new Rect(panel.x, panel.y + 60, panel.width, 60), stats, new GUIStyle(center) { fontSize = 17 });
+                StatLine(game.displayNames[0], a) + "\n" +
+                StatLine(game.displayNames[1], b);
+            GUI.Label(new Rect(panel.x, panel.y + 50, panel.width, 82), stats, new GUIStyle(center) { fontSize = 15 });
 
             if (m.judge.rounds.Count > 0)
             {
@@ -131,7 +135,8 @@ namespace FightTrainer.Game
                 string verdict = last.score0 > last.score1 ? game.displayNames[0] + " probably won that round"
                                : last.score1 > last.score0 ? game.displayNames[1] + " probably won that round"
                                : "That round looked even";
-                GUI.Label(new Rect(panel.x, panel.y + 125, panel.width, 30), verdict, center);
+                if (last.decidedByRingControl) verdict += " (on ring control)";
+                GUI.Label(new Rect(panel.x, panel.y + 135, panel.width, 30), verdict, center);
             }
 
             if (game.inputs[0].IsHuman)
@@ -151,6 +156,99 @@ namespace FightTrainer.Game
 
             int secs = Mathf.CeilToInt(m.CornerTicksLeft / (float)FightConfig.TicksPerSecond);
             GUI.Label(new Rect(panel.x, panel.y + 270, panel.width, 30), "Next round in " + secs + "s", small);
+        }
+
+        private static string StatLine(string name, Fighter f)
+        {
+            const float tps = FightConfig.TicksPerSecond;
+            return name + ":  hits " + f.hitsLandedThisRound + " (" + f.angleHitsThisRound + " from angles) · blocks " + f.blocksThisRound +
+                   " · dodges " + f.dodgesThisRound + "\n      centre " + Mathf.RoundToInt(f.ticksCenterControlThisRound / tps) + "s" +
+                   " · on the ropes " + Mathf.RoundToInt(f.ticksOnRopesThisRound / tps) + "s" +
+                   " · in a corner " + Mathf.RoundToInt(f.ticksInCornerThisRound / tps) + "s";
+        }
+
+        /// <summary>
+        /// Top-down view of the ring: ropes, centre, both fighters with the direction their guard faces,
+        /// and live ring-position readouts (on the ropes / in a corner / who controls the centre).
+        /// </summary>
+        private void Minimap(FightMatch m, float w, bool large)
+        {
+            FightConfig c = game.config;
+            float size = large ? 300f : 170f;
+            Rect panel = new Rect(w - size - 24f, H - size - 92f, size, size);
+            float pad = 12f;
+            Rect ring = new Rect(panel.x + pad, panel.y + pad, panel.width - pad * 2f, panel.height - pad * 2f);
+            float half = ring.width * 0.5f;
+            Vector2 centre = ring.center;
+
+            Fill(panel, new Color(0f, 0f, 0f, 0.55f));
+            Fill(ring, new Color(0.22f, 0.2f, 0.24f, 0.95f));
+
+            // Rope zone shading (where a fighter counts as "on the ropes").
+            float zone = (c.ropeZone + c.fighterWidth * 0.5f) / c.ringHalfSize * half;
+            Color zc = new Color(0.75f, 0.15f, 0.2f, 0.18f);
+            Fill(new Rect(ring.x, ring.y, ring.width, zone), zc);
+            Fill(new Rect(ring.x, ring.yMax - zone, ring.width, zone), zc);
+            Fill(new Rect(ring.x, ring.y + zone, zone, ring.height - zone * 2f), zc);
+            Fill(new Rect(ring.xMax - zone, ring.y + zone, zone, ring.height - zone * 2f), zc);
+
+            // Ropes and posts.
+            Color rope = new Color(0.85f, 0.2f, 0.25f);
+            Fill(new Rect(ring.x, ring.y, ring.width, 2f), rope);
+            Fill(new Rect(ring.x, ring.yMax - 2f, ring.width, 2f), rope);
+            Fill(new Rect(ring.x, ring.y, 2f, ring.height), rope);
+            Fill(new Rect(ring.xMax - 2f, ring.y, 2f, ring.height), rope);
+            foreach (Vector2 corner in new[] { new Vector2(ring.x, ring.y), new Vector2(ring.xMax, ring.y), new Vector2(ring.x, ring.yMax), new Vector2(ring.xMax, ring.yMax) })
+                Fill(new Rect(corner.x - 4f, corner.y - 4f, 8f, 8f), new Color(0.6f, 0.6f, 0.65f));
+            Fill(new Rect(centre.x - 3f, centre.y - 3f, 6f, 6f), new Color(1f, 1f, 1f, 0.25f));
+
+            // Fighters.
+            Color[] colors = { new Color(0.25f, 0.55f, 1f), new Color(0.75f, 0.75f, 0.75f) };
+            float scale = half / c.ringHalfSize;
+            for (int i = 0; i < 2; i++)
+            {
+                Fighter f = m.sim.fighters[i];
+                Vector2 p = new Vector2(centre.x + f.pos.x * scale, centre.y - f.pos.y * scale);
+                float dot = Mathf.Max(8f, c.fighterWidth * scale);
+
+                // Guard direction: a short line of dots; brighter while blocking.
+                bool blocking = f.mode == FighterMode.Block || f.mode == FighterMode.Blockstun;
+                Color guardCol = blocking ? Color.white : new Color(colors[i].r, colors[i].g, colors[i].b, 0.8f);
+                for (int k = 1; k <= 5; k++)
+                {
+                    float d = dot * 0.5f + k * 3f;
+                    Fill(new Rect(p.x + f.facing.x * d - 1.5f, p.y - f.facing.y * d - 1.5f, 3f, 3f), guardCol);
+                }
+
+                Color body = f.IsKO ? colors[i] * 0.4f : colors[i];
+                if (f.mode == FighterMode.Attack && f.Phase(c) == AttackPhase.Active) body = new Color(1f, 0.3f, 0.2f);
+                Fill(new Rect(p.x - dot * 0.5f, p.y - dot * 0.5f, dot, dot), body);
+            }
+
+            // Live readouts under the map.
+            Fighter a = m.sim.fighters[0], b = m.sim.fighters[1];
+            string status = RingStatus(game.displayNames[0], a) + "   " + RingStatus(game.displayNames[1], b);
+            int ca = a.ticksCenterControlThisRound, cb = b.ticksCenterControlThisRound;
+            string control = ca + cb == 0 ? "Centre: even"
+                           : "Centre: " + game.displayNames[0] + " " + Mathf.RoundToInt(100f * ca / (ca + cb)) + "% · " +
+                             game.displayNames[1] + " " + Mathf.RoundToInt(100f * cb / (ca + cb)) + "%";
+            GUIStyle st = new GUIStyle(small) { alignment = TextAnchor.UpperRight };
+            GUI.Label(new Rect(panel.xMax - 400f, panel.yMax + 4f, 400f, 20f), status, st);
+            GUI.Label(new Rect(panel.xMax - 400f, panel.yMax + 22f, 400f, 20f), control, st);
+        }
+
+        private static string RingStatus(string name, Fighter f)
+        {
+            if (f.inCorner) return name + ": CORNER";
+            if (f.onRopes) return name + ": ropes";
+            return name + ": open";
+        }
+
+        private static void Fill(Rect r, Color color)
+        {
+            GUI.color = color;
+            GUI.DrawTexture(r, GreyboxArt.WhiteTexture);
+            GUI.color = Color.white;
         }
 
         private static void Bar(Rect r, float fill, Color color, bool fromRight)

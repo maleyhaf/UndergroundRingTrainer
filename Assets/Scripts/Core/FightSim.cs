@@ -7,12 +7,16 @@ namespace FightTrainer.Core
     /// The fight itself, advanced one fixed tick (1/60s) at a time. Deterministic and Unity-free:
     /// the same inputs always produce the same fight, which keeps frame data exact and ML data clean.
     ///
+    /// The fight happens on a square ring seen from above (2D positions). Fighters can move toward,
+    /// away from, and around each other. They turn to face their opponent at a limited speed; turning
+    /// is slow while blocking, so circling around a blocker can get outside their guard.
+    ///
     /// Order inside a tick:
     ///   1. Each fighter tries to act on its button (accepted or ignored depending on its state)
     ///   2. Fighters advance (frame counters, movement, timers)
-    ///   3. Bodies are pushed apart and kept inside the arena
-    ///   4. Active attacks are checked against the other fighter (hit / block / dodge)
-    ///   5. Facing and stamina are updated
+    ///   3. Bodies are pushed apart and kept inside the ropes
+    ///   4. Active attacks are checked against the other fighter (hit / block / angle / dodge)
+    ///   5. Facing, stamina and ring-position stats are updated
     /// </summary>
     public class FightSim
     {
@@ -35,7 +39,12 @@ namespace FightTrainer.Core
 
         public Fighter Opponent(Fighter f) { return fighters[1 - f.index]; }
 
-        public float Distance { get { return Math.Abs(fighters[1].x - fighters[0].x); } }
+        public float Distance { get { return Vec2.Distance(fighters[0].pos, fighters[1].pos); } }
+
+        /// <summary>Unit direction from a fighter toward its opponent.</summary>
+        public Vec2 ToOpponent(Fighter f) { return (Opponent(f).pos - f.pos).Normalized; }
+
+        private float Radius { get { return config.fighterWidth * 0.5f; } }
 
         // ------------------------------------------------------------------ resets
 
@@ -58,12 +67,13 @@ namespace FightTrainer.Core
             for (int i = 0; i < 2; i++)
             {
                 Fighter f = fighters[i];
-                f.x = (i == 0 ? -1f : 1f) * config.startDistance * 0.5f;
-                f.prevX = f.x;
-                f.facing = i == 0 ? 1 : -1;
-                f.walkVelocity = 0f;
-                f.knockVelocity = 0f;
-                f.mode = f.IsKO ? FighterMode.KO : FighterMode.Idle;
+                f.pos = new Vec2((i == 0 ? -1f : 1f) * config.startDistance * 0.5f, 0f);
+                f.prevPos = f.pos;
+                f.facing = new Vec2(i == 0 ? 1f : -1f, 0f);
+                f.walkAction = FighterAction.Idle;
+                f.knockVelocity = Vec2.Zero;
+                f.dashDir = Vec2.Zero;
+                f.mode = FighterMode.Idle; // a KO ends the fight, so a reset always clears it
                 f.modeFrame = 0;
                 f.modeDuration = 0;
                 f.currentAttack = FighterAction.Idle;
@@ -75,6 +85,8 @@ namespace FightTrainer.Core
                 f.counterWindow = 0;
                 f.lastAction = FighterAction.Idle;
                 f.ticksSinceLastAction = 0;
+                f.onRopes = false;
+                f.inCorner = false;
                 f.ResetRoundStats();
             }
         }
@@ -87,8 +99,8 @@ namespace FightTrainer.Core
             tickEvents.Clear();
 
             Fighter f0 = fighters[0], f1 = fighters[1];
-            f0.prevX = f0.x;
-            f1.prevX = f1.x;
+            f0.prevPos = f0.pos;
+            f1.prevPos = f1.pos;
 
             ApplyAction(f0, action0);
             ApplyAction(f1, action1);
@@ -103,6 +115,7 @@ namespace FightTrainer.Core
             UpdateFacing(f1);
             RegenStamina(f0);
             RegenStamina(f1);
+            UpdateRingStats();
         }
 
         // ------------------------------------------------------------------ 1. actions
@@ -156,7 +169,6 @@ namespace FightTrainer.Core
             }
 
             // Idle / Walk / Block: free to do anything.
-            f.walkVelocity = 0f;
             switch (a)
             {
                 case FighterAction.Idle:
@@ -165,19 +177,17 @@ namespace FightTrainer.Core
 
                 case FighterAction.Forward:
                 case FighterAction.Back:
-                {
-                    bool forward = a == FighterAction.Forward;
-                    float speed = forward ? config.walkForwardSpeed : config.walkBackSpeed;
-                    f.walkVelocity = (forward ? f.facing : -f.facing) * speed;
+                case FighterAction.CircleLeft:
+                case FighterAction.CircleRight:
+                    f.walkAction = a;
                     if (f.mode != FighterMode.Walk) SetMode(f, FighterMode.Walk);
                     return true;
-                }
 
                 case FighterAction.DashIn:
                 case FighterAction.DashOut:
                     if (f.stamina < config.dashStaminaCost) { SetMode(f, FighterMode.Idle); return false; }
                     f.stamina -= config.dashStaminaCost;
-                    f.dashDir = a == FighterAction.DashIn ? f.facing : -f.facing;
+                    f.dashDir = a == FighterAction.DashIn ? ToOpponent(f) : -ToOpponent(f);
                     SetMode(f, FighterMode.Dash);
                     return true;
 
@@ -221,7 +231,8 @@ namespace FightTrainer.Core
             f.attackIsCounter = f.counterWindow > 0;
             f.counterWindow = 0;
             f.dodgeSuccess = false;
-            f.walkVelocity = 0f;
+            // The punch is aimed where the fighter is facing when it starts and stays locked there.
+            // A target that circles away during the wind-up can slip out of its path.
             SetMode(f, FighterMode.Attack);
             Emit(FightEventType.AttackStarted, f.index, -1, a, 0f);
         }
@@ -242,11 +253,11 @@ namespace FightTrainer.Core
             switch (f.mode)
             {
                 case FighterMode.Walk:
-                    f.x += f.walkVelocity;
+                    Walk(f);
                     break;
 
                 case FighterMode.Dash:
-                    f.x += f.dashDir * config.dashSpeed;
+                    f.pos = f.pos + f.dashDir * config.dashSpeed;
                     if (f.modeFrame >= config.dashFrames) SetMode(f, FighterMode.Idle);
                     break;
 
@@ -275,11 +286,11 @@ namespace FightTrainer.Core
             }
 
             // Knockback slides the fighter and decays.
-            if (f.knockVelocity != 0f)
+            if (f.knockVelocity.x != 0f || f.knockVelocity.y != 0f)
             {
-                f.x += f.knockVelocity;
-                f.knockVelocity *= 0.8f;
-                if (Math.Abs(f.knockVelocity) < 0.002f) f.knockVelocity = 0f;
+                f.pos = f.pos + f.knockVelocity;
+                f.knockVelocity = f.knockVelocity * 0.8f;
+                if (f.knockVelocity.Length < 0.002f) f.knockVelocity = Vec2.Zero;
             }
 
             // The Counter Window only starts counting down once the dodge's invulnerability is over.
@@ -287,56 +298,84 @@ namespace FightTrainer.Core
                 f.counterWindow--;
         }
 
+        private void Walk(Fighter f)
+        {
+            // Directions are measured from where the opponent stood at the start of this tick.
+            Vec2 target = Opponent(f).prevPos;
+            Vec2 offset = target - f.pos;
+            float dist = offset.Length;
+            Vec2 u = offset.Normalized;
+
+            switch (f.walkAction)
+            {
+                case FighterAction.Forward:
+                    f.pos = f.pos + u * config.walkForwardSpeed;
+                    break;
+                case FighterAction.Back:
+                    f.pos = f.pos - u * config.walkBackSpeed;
+                    break;
+                case FighterAction.CircleLeft:
+                case FighterAction.CircleRight:
+                {
+                    // Sidestep, then pull back onto the same circle so circling keeps the distance.
+                    Vec2 side = f.walkAction == FighterAction.CircleLeft ? u.Left : -u.Left;
+                    Vec2 moved = f.pos + side * config.circleSpeed;
+                    f.pos = target - (target - moved).Normalized * dist;
+                    break;
+                }
+            }
+        }
+
         // ------------------------------------------------------------------ 3. bodies
 
         private void ResolveBodies()
         {
             Fighter a = fighters[0], b = fighters[1];
-            float minGap = config.fighterWidth;
-            float d = b.x - a.x;
-            if (Math.Abs(d) < minGap)
-            {
-                float push = (minGap - Math.Abs(d)) * 0.5f;
-                int s = d >= 0f ? 1 : -1;
-                a.x -= s * push;
-                b.x += s * push;
-            }
+            float limit = config.ringHalfSize - Radius;
 
-            float limit = config.arenaHalfWidth - config.fighterWidth * 0.5f;
-            foreach (Fighter f in fighters) f.x = Clamp(f.x, -limit, limit);
-
-            // If a wall stopped one fighter, keep them apart by moving the other.
-            d = b.x - a.x;
-            if (Math.Abs(d) < minGap)
+            for (int iteration = 0; iteration < 3; iteration++)
             {
-                int s = d >= 0f ? 1 : -1;
-                if (Math.Abs(a.x) >= limit - 0.0001f) b.x = a.x + s * minGap;
-                else a.x = b.x - s * minGap;
+                Vec2 d = b.pos - a.pos;
+                float dist = d.Length;
+                if (dist < config.fighterWidth)
+                {
+                    Vec2 n = dist > 1e-5f ? d * (1f / dist) : new Vec2(1f, 0f);
+                    float push = (config.fighterWidth - dist) * 0.5f;
+                    a.pos = a.pos - n * push;
+                    b.pos = b.pos + n * push;
+                }
+                a.pos = ClampToRing(a.pos, limit);
+                b.pos = ClampToRing(b.pos, limit);
             }
+        }
+
+        private static Vec2 ClampToRing(Vec2 p, float limit)
+        {
+            return new Vec2(Clamp(p.x, -limit, limit), Clamp(p.y, -limit, limit));
         }
 
         // ------------------------------------------------------------------ 4. hits
 
-        public struct Box
-        {
-            public float min, max;
-            public Box(float min, float max) { this.min = min; this.max = max; }
-            public bool Overlaps(Box o) { return min <= o.max && o.min <= max; }
-        }
-
-        public Box Hurtbox(Fighter f)
-        {
-            float h = config.fighterWidth * 0.5f;
-            return new Box(f.x - h, f.x + h);
-        }
-
-        /// <summary>The fist's reach in front of the body. Width only; there is no jumping in this game.</summary>
-        public Box Hitbox(Fighter f)
+        /// <summary>The punch as a line from the front of the body out to the fist's full reach.</summary>
+        public void HitSegment(Fighter f, out Vec2 front, out Vec2 tip)
         {
             MoveData m = config.Move(f.currentAttack);
-            float front = f.x + f.facing * config.fighterWidth * 0.5f;
-            float tip = front + f.facing * m.reach;
-            return new Box(Math.Min(front, tip), Math.Max(front, tip));
+            front = f.pos + f.facing * Radius;
+            tip = front + f.facing * m.reach;
+        }
+
+        public bool AttackReaches(Fighter atk, Fighter def)
+        {
+            Vec2 front, tip;
+            HitSegment(atk, out front, out tip);
+            return Vec2.DistanceToSegment(def.pos, front, tip) <= Radius;
+        }
+
+        /// <summary>Is the attacker inside the defender's guard arc (so a block would cover the hit)?</summary>
+        public bool InsideGuard(Fighter def, Fighter atk)
+        {
+            Vec2 toAtk = (atk.pos - def.pos).Normalized;
+            return Math.Abs(Vec2.SignedAngle(def.facing, toAtk)) <= config.blockArcDegrees;
         }
 
         private readonly List<int> pendingHits = new List<int>(2);
@@ -351,7 +390,7 @@ namespace FightTrainer.Core
                 if (atk.Phase(config) != AttackPhase.Active) continue;
                 Fighter def = Opponent(atk);
                 if (def.IsKO) continue;
-                if (Hitbox(atk).Overlaps(Hurtbox(def))) pendingHits.Add(atk.index);
+                if (AttackReaches(atk, def)) pendingHits.Add(atk.index);
             }
             foreach (int i in pendingHits) ApplyHit(fighters[i], fighters[1 - i]);
         }
@@ -371,14 +410,17 @@ namespace FightTrainer.Core
                 return;
             }
 
+            bool blocking = def.mode == FighterMode.Block || def.mode == FighterMode.Blockstun;
+            bool angled = blocking && !InsideGuard(def, atk);
+
             // Blocked: chip damage + stamina drain. A blocked hit does NOT allow chaining.
-            if (def.mode == FighterMode.Block || def.mode == FighterMode.Blockstun)
+            if (blocking && !angled)
             {
                 float chip = m.damage * config.blockDamageMultiplier;
                 Damage(atk, def, chip);
                 def.blocksThisRound++;
                 def.stamina -= m.blockStaminaDrain;
-                def.knockVelocity = atk.facing * m.knockback * 0.6f;
+                def.knockVelocity = atk.facing * (m.knockback * 0.6f);
                 if (def.stamina <= 0f)
                 {
                     def.stamina = 0f;
@@ -394,15 +436,18 @@ namespace FightTrainer.Core
                 return;
             }
 
-            // Clean hit.
+            // Clean hit (including one that got around the guard from the side).
             float dmg = m.damage * (atk.attackIsCounter ? config.counterDamageMultiplier : 1f);
             Damage(atk, def, dmg);
             atk.attackConnected = true;
             atk.hitsLandedThisRound++;
+            if (angled) atk.angleHitsThisRound++;
             def.knockVelocity = atk.facing * m.knockback;
-            def.walkVelocity = 0f;
             SetMode(def, FighterMode.Hitstun, m.hitstun);
-            Emit(atk.attackIsCounter ? FightEventType.CounterHit : FightEventType.Hit, atk.index, def.index, atk.currentAttack, dmg);
+            FightEventType type = atk.attackIsCounter ? FightEventType.CounterHit
+                                : angled ? FightEventType.AngleHit
+                                : FightEventType.Hit;
+            Emit(type, atk.index, def.index, atk.currentAttack, dmg);
             atk.attackIsCounter = false; // the bonus applies to the first hit only
             CheckKO(atk, def);
         }
@@ -422,13 +467,22 @@ namespace FightTrainer.Core
             Emit(FightEventType.KO, atk.index, def.index, atk.currentAttack, 0f);
         }
 
-        // ------------------------------------------------------------------ 5. facing + stamina
+        // ------------------------------------------------------------------ 5. facing, stamina, ring stats
 
         private void UpdateFacing(Fighter f)
         {
-            if (f.mode == FighterMode.Attack || f.mode == FighterMode.Dash || f.IsKO) return;
-            float d = Opponent(f).x - f.x;
-            if (Math.Abs(d) > 0.01f) f.facing = d > 0f ? 1 : -1;
+            float rate;
+            switch (f.mode)
+            {
+                case FighterMode.Idle:
+                case FighterMode.Walk: rate = config.turnRateFree; break;
+                case FighterMode.Block:
+                case FighterMode.Blockstun: rate = config.turnRateBlock; break;
+                case FighterMode.Dodge: rate = config.turnRateDodge; break;
+                default: return; // attacking, dashing, stunned, KO: no turning
+            }
+            if (Distance < 0.01f) return;
+            f.facing = Vec2.RotateTowards(f.facing, ToOpponent(f), rate);
         }
 
         private void RegenStamina(Fighter f)
@@ -440,11 +494,29 @@ namespace FightTrainer.Core
                     regen = config.staminaRegenIdle;
                     break;
                 case FighterMode.Walk:
-                    bool backing = Math.Sign(f.walkVelocity) == -f.facing;
-                    regen = backing ? config.staminaRegenBack : config.staminaRegenWalk;
+                    regen = f.walkAction == FighterAction.Back ? config.staminaRegenBack : config.staminaRegenWalk;
                     break;
             }
             f.stamina = Clamp(f.stamina + regen, 0f, config.maxStamina);
+        }
+
+        private void UpdateRingStats()
+        {
+            float zone = config.ropeZone;
+            float edge = config.ringHalfSize - Radius;
+            foreach (Fighter f in fighters)
+            {
+                bool nearX = edge - Math.Abs(f.pos.x) < zone;
+                bool nearY = edge - Math.Abs(f.pos.y) < zone;
+                f.onRopes = nearX || nearY;
+                f.inCorner = nearX && nearY;
+                if (f.onRopes) f.ticksOnRopesThisRound++;
+                if (f.inCorner) f.ticksInCornerThisRound++;
+            }
+
+            float c0 = fighters[0].pos.Length, c1 = fighters[1].pos.Length;
+            if (c0 + config.centerControlMargin < c1) fighters[0].ticksCenterControlThisRound++;
+            else if (c1 + config.centerControlMargin < c0) fighters[1].ticksCenterControlThisRound++;
         }
 
         // ------------------------------------------------------------------ helpers

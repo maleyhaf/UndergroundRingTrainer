@@ -35,10 +35,15 @@ namespace FightTrainer.Core
     {
         public const int TicksPerSecond = 60;
 
-        // Arena / bodies (world units)
-        public float arenaHalfWidth = 6f;
+        // Ring / bodies (world units). The ring is a square seen from above, centred on (0, 0).
+        public float ringHalfSize = 4f;
+        /// <summary>Body diameter (bodies are circles seen from above).</summary>
         public float fighterWidth = 0.8f;
         public float startDistance = 3f;
+        /// <summary>Within this distance of a rope, a fighter counts as "on the ropes".</summary>
+        public float ropeZone = 0.7f;
+        /// <summary>A fighter controls the centre when this much closer to it than the opponent.</summary>
+        public float centerControlMargin = 0.3f;
 
         // Resources
         public float maxHp = 100f;
@@ -47,6 +52,8 @@ namespace FightTrainer.Core
         // Movement
         public float walkForwardSpeed = 0.055f;
         public float walkBackSpeed = 0.045f;
+        /// <summary>Sideways speed when circling around the opponent.</summary>
+        public float circleSpeed = 0.045f;
         public int dashFrames = 15;
         public float dashSpeed = 0.16f;
         public float dashStaminaCost = 6f;
@@ -59,7 +66,15 @@ namespace FightTrainer.Core
         public int counterWindowFrames = 15;
         public float counterDamageMultiplier = 1.5f;
 
+        // Turning toward the opponent (degrees per tick). Slow turning while blocking is what lets
+        // circling create angles: get outside the guard and the block no longer covers you.
+        public float turnRateFree = 8f;
+        public float turnRateBlock = 1.0f;
+        public float turnRateDodge = 4f;
+
         // Block
+        /// <summary>A block only covers attacks arriving within this many degrees of where the fighter faces.</summary>
+        public float blockArcDegrees = 70f;
         public float blockDamageMultiplier = 0.25f;
         public int guardBreakFrames = 40;
 
